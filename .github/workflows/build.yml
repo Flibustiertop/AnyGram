@@ -119,9 +119,12 @@ jobs:
           cd /Users/Shared/telegram-ios
           BAZEL_ROOT="/private/var/tmp/_bazel_anygram"
 
+          # Disable extensions via .bazelrc so App Groups are removed at compile time
+          # This fixes the "black screen" crash when sideloaded with a free Apple ID
+          echo 'build --//Telegram:disableExtensions=true' >> /Users/Shared/telegram-ios/.bazelrc
+
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_ROOT" \
-            --bazelArguments "--//Telegram:disableExtensions=true" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
