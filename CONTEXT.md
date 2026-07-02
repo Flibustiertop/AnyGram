@@ -113,7 +113,30 @@ In `apply_branding.py`:
 
 ---
 
-## 8. Common Problems & Fixes
+## 8. WHY BLACK SCREEN HAPPENS (and how to avoid it)
+
+### Root causes of black screen after Sideloadly install:
+
+| Cause | Symptom | Fix |
+|-------|---------|-----|
+| `enable_icloud: true` in config | Crash on launch (iCloud entitlement not granted by free Apple ID) | Set `enable_icloud: false` in config |
+| `enable_siri: true` in config | Crash on launch | Set `enable_siri: false` |
+| APNS `production` environment | Crash / black screen | Patch entitlements to `development` |
+| Wrong `bundle_id` in config | Build fails / codesigning mismatch | Keep `ph.telegra.Telegraph` — matches fake-codesigning profiles |
+| Wrong `team_id` in config | Build fails / codesigning mismatch | Keep `C67CF9S4VU` — matches fake-codesigning certs |
+| Missing or wrong API keys | App opens but can't connect | Use correct `api_id` / `api_hash` from my.telegram.org |
+
+### CRITICAL RULE about bundle_id and team_id:
+The `fake-codesigning/profiles/*.mobileprovision` files inside Swiftgram are tied to:
+- `bundle_id = "ph.telegra.Telegraph"`
+- `team_id = "C67CF9S4VU"`
+
+NEVER change these in the config — the IPA will fail to build or sign.
+The display name "AnyGram" comes from `Info.plist CFBundleDisplayName`, NOT from bundle_id.
+
+---
+
+## 9. Common Build Problems & Fixes
 
 ### Build times out (6h limit)
 - Shallow clone helps a lot (`--depth=1 --shallow-submodules`)
