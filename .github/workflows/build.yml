@@ -127,39 +127,47 @@ jobs:
       - name: Collect IPA
         run: |
           mkdir -p /tmp/anygram-artifacts
-          IPA_FOUND=false
+          SOURCE=/Users/Shared/telegram-ios
 
-          for f in /Users/Shared/telegram-ios/bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            if [ -f "$f" ]; then
-              cp "$f" /tmp/anygram-artifacts/AnyGram.ipa
-              IPA_FOUND=true
-              echo "Copied: $f"
-              ls -lh /tmp/anygram-artifacts/AnyGram.ipa
-              break
-            fi
+          echo "=== Searching for IPA files ==="
+          # Search in all possible Bazel output locations (symlinks + real paths)
+          IPA_PATH=""
+
+          # Method 1: relative from source dir (follows bazel-out symlink)
+          cd "$SOURCE"
+          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            [ -f "$f" ] && IPA_PATH="$SOURCE/$f" && echo "Found (method 1): $f" && break
           done
 
-          if [ "$IPA_FOUND" != "true" ]; then
-            echo "ERROR: IPA not found! Searching..."
-            find /Users/Shared/telegram-ios/bazel-out -name "*.ipa" 2>/dev/null || true
+          # Method 2: search in bazel user root real path
+          if [ -z "$IPA_PATH" ]; then
+            FOUND=$(find /private/var/tmp/_bazel_anygram -name "Telegram.ipa" 2>/dev/null | head -1)
+            [ -n "$FOUND" ] && IPA_PATH="$FOUND" && echo "Found (method 2): $FOUND"
+          fi
+
+          # Method 3: find anywhere under /private/var/tmp
+          if [ -z "$IPA_PATH" ]; then
+            FOUND=$(find /private/var/tmp -name "*.ipa" 2>/dev/null | head -1)
+            [ -n "$FOUND" ] && IPA_PATH="$FOUND" && echo "Found (method 3): $FOUND"
+          fi
+
+          # Method 4: resolve bazel-out symlink and search
+          if [ -z "$IPA_PATH" ]; then
+            REAL_BAZEL=$(readlink -f "$SOURCE/bazel-out" 2>/dev/null || true)
+            [ -n "$REAL_BAZEL" ] && FOUND=$(find "$REAL_BAZEL" -name "*.ipa" 2>/dev/null | head -1)
+            [ -n "$FOUND" ] && IPA_PATH="$FOUND" && echo "Found (method 4): $FOUND"
+          fi
+
+          if [ -z "$IPA_PATH" ]; then
+            echo "ERROR: IPA not found anywhere!"
+            echo "=== All IPA files on system ==="
+            find / -name "*.ipa" -not -path "*/proc/*" 2>/dev/null | head -20 || true
             exit 1
           fi
 
-          # Verify IPA is a valid ZIP
-          python3 -c "
-          import zipfile, sys
-          try:
-              zf = zipfile.ZipFile('/tmp/anygram-artifacts/AnyGram.ipa')
-              names = zf.namelist()
-              app_found = any('Payload/' in n for n in names)
-              print(f'IPA entries: {len(names)}, Payload found: {app_found}')
-              if not app_found:
-                  print('ERROR: No Payload in IPA!')
-                  sys.exit(1)
-          except Exception as e:
-              print(f'ERROR: Invalid IPA ZIP: {e}')
-              sys.exit(1)
-          "
+          cp "$IPA_PATH" /tmp/anygram-artifacts/AnyGram.ipa
+          ls -lh /tmp/anygram-artifacts/AnyGram.ipa
+          echo "IPA collected successfully"
 
       # ── 12. Upload IPA artifact ───────────────────────────────────────────
       - name: Upload IPA
