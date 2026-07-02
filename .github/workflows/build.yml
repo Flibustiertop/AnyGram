@@ -121,12 +121,12 @@ jobs:
 
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_ROOT" \
+            --bazelArguments "--//Telegram:disableExtensions=true" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="${{ steps.meta.outputs.BUILD_NUMBER }}" \
-            --disableExtensions
+            --buildNumber="${{ steps.meta.outputs.BUILD_NUMBER }}"
 
       # ── 11. Collect & verify IPA ──────────────────────────────────────────
       - name: Collect IPA
