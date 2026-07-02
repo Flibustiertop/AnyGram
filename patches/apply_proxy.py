@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Injects a hardcoded default MTProto proxy into AppDelegate.swift.
-The proxy is set on first launch via updateProxySettingsInteractively.
+Injects a default MTProto proxy into Telegram iOS.
 
-Proxy:  server=78.17.154.32  port=443
-Secret: ee012c78136de96da97a3b0c9b5dc635fd6966636f6e6669672e6d65  (FakeTLS/MTProto)
+Proxy: server=78.17.154.32 port=443
+Secret: ee012c78136de96da97a3b0c9b5dc635fd6966636f6e6669672e6d65 (FakeTLS)
+
+Strategy: Creates AnyGramProxySetup.swift and patches AppDelegate.swift
+to call it right after the accountManager is available.
+
+Imports used: TelegramCore (contains ProxyServerSettings, updateProxySettingsInteractively)
+              SwiftSignalKit (contains deliverOnMainQueue, Signal .start())
 """
 import sys, os, re
 
@@ -14,150 +19,126 @@ PROXY_SERVER = "78.17.154.32"
 PROXY_PORT   = 443
 PROXY_SECRET = "ee012c78136de96da97a3b0c9b5dc635fd6966636f6e6669672e6d65"
 
-# Swift code to inject (placed right before the closing brace of didFinishLaunchingWithOptions)
-PROXY_SWIFT = f'''
-        // AnyGram: inject default MTProto proxy on first launch
-        AnyGramProxySetup.injectDefaultProxy(
-            accountManager: accountManager,
-            server: "{PROXY_SERVER}",
-            port: {PROXY_PORT},
-            secretHex: "{PROXY_SECRET}"
-        )
-'''
-
-# File to create: AnyGramProxySetup.swift
-PROXY_SETUP_SWIFT = '''import Foundation
+# ── Swift helper file ─────────────────────────────────────────────────────────
+PROXY_SETUP_SWIFT = f'''// AnyGramProxySetup.swift — auto-generated, do not edit
+import Foundation
 import TelegramCore
-import Postbox
 import SwiftSignalKit
 
-struct AnyGramProxySetup {
-    static func injectDefaultProxy(
-        accountManager: AccountManager<TelegramAccountManagerTypes>,
-        server: String,
-        port: Int32,
-        secretHex: String
-    ) {
-        let key = "anygram_default_proxy_v2"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
+public func anygramInjectDefaultProxy(accountManager: AccountManager<TelegramAccountManagerTypes>) {{
+    let key = "anygram_proxy_v2"
+    guard !UserDefaults.standard.bool(forKey: key) else {{ return }}
 
-        // Convert hex secret to Data
-        var secretData = Data()
-        var index = secretHex.startIndex
-        while index < secretHex.endIndex {
-            let nextIndex = secretHex.index(index, offsetBy: 2)
-            if let byte = UInt8(secretHex[index..<nextIndex], radix: 16) {
-                secretData.append(byte)
-            }
-            index = nextIndex
-        }
+    // Convert hex secret → Data
+    let hex = "{PROXY_SECRET}"
+    var secretBytes = [UInt8]()
+    var idx = hex.startIndex
+    while idx < hex.endIndex {{
+        let next = hex.index(idx, offsetBy: 2)
+        if let byte = UInt8(hex[idx..<next], radix: 16) {{ secretBytes.append(byte) }}
+        idx = next
+    }}
+    let secretData = Data(secretBytes)
 
-        let proxyServer = ProxyServerSettings(
-            host: server,
-            port: port,
-            connection: .mtp(secret: secretData)
-        )
+    let server = ProxyServerSettings(
+        host: "{PROXY_SERVER}",
+        port: {PROXY_PORT},
+        connection: .mtp(secret: secretData)
+    )
 
-        let _ = (updateProxySettingsInteractively(accountManager: accountManager) { settings in
-            var settings = settings
-            // Add only if not already present
-            if !settings.servers.contains(where: { $0.host == server && $0.port == port }) {
-                settings.servers.append(proxyServer)
-            }
-            settings.activeServer = proxyServer
-            settings.enabled = true
-            return settings
-        } |> deliverOnMainQueue).start(next: { _ in
-            UserDefaults.standard.set(true, forKey: key)
-        })
-    }
-}
+    let _ = (updateProxySettingsInteractively(accountManager: accountManager) {{ current in
+        var s = current
+        if !s.servers.contains(where: {{ $0.host == "{PROXY_SERVER}" && $0.port == {PROXY_PORT} }}) {{
+            s.servers.append(server)
+        }}
+        s.activeServer = server
+        s.enabled = true
+        return s
+    }} |> deliverOnMainQueue).start(next: {{ _ in
+        UserDefaults.standard.set(true, forKey: key)
+        print("[AnyGram] Default proxy set")
+    }})
+}}
 '''
 
-# Write AnyGramProxySetup.swift next to AppDelegate
-app_delegate_dir = os.path.join(REPO, "submodules", "TelegramUI", "Sources")
-proxy_setup_path = os.path.join(app_delegate_dir, "AnyGramProxySetup.swift")
+# ── Write AnyGramProxySetup.swift ─────────────────────────────────────────────
+sources_dir = os.path.join(REPO, "submodules", "TelegramUI", "Sources")
+proxy_file  = os.path.join(sources_dir, "AnyGramProxySetup.swift")
 
-with open(proxy_setup_path, 'w') as f:
+os.makedirs(sources_dir, exist_ok=True)
+with open(proxy_file, 'w') as f:
     f.write(PROXY_SETUP_SWIFT)
-print(f"[OK] Created {proxy_setup_path}")
+print(f"[OK] Created {proxy_file}")
 
-# Patch AppDelegate.swift: find where accountManager is first stored and inject our call
-app_delegate_path = os.path.join(app_delegate_dir, "AppDelegate.swift")
-if not os.path.exists(app_delegate_path):
-    print(f"[WARN] AppDelegate.swift not found at {app_delegate_path}, skipping injection")
+# ── Patch AppDelegate.swift ───────────────────────────────────────────────────
+app_delegate = os.path.join(sources_dir, "AppDelegate.swift")
+if not os.path.exists(app_delegate):
+    print(f"[WARN] AppDelegate.swift not found, skipping injection")
     sys.exit(0)
 
-with open(app_delegate_path) as f:
+with open(app_delegate) as f:
     content = f.read()
 
-# Find a stable injection point: right after SharedAccountContext is created
-# Look for the pattern "SharedAccountContext(" and inject after its line
-injection_marker = "let sharedContext = SharedAccountContext("
-if injection_marker in content:
-    # Find the block — the SharedAccountContext init likely spans multiple lines
-    # Find where the line ends (find the closing paren of the SharedAccountContext call)
-    idx = content.index(injection_marker)
-    # Count open parens to find end of constructor call
-    depth = 0
-    i = idx
-    found_end = -1
-    while i < len(content):
-        if content[i] == '(':
-            depth += 1
-        elif content[i] == ')':
-            depth -= 1
-            if depth == 0:
-                found_end = i
-                break
-        i += 1
+INJECTION = f'''
+        // AnyGram: enable default MTProto proxy on first launch
+        anygramInjectDefaultProxy(accountManager: accountManager)
+'''
 
-    if found_end >= 0:
-        # Insert after the closing ) and its line
-        newline_after = content.index('\n', found_end)
-        injection_point = newline_after + 1
-        patched = (
-            content[:injection_point]
-            + PROXY_SWIFT
-            + content[injection_point:]
-        )
-        with open(app_delegate_path, 'w') as f:
-            f.write(patched)
-        print(f"[OK] Injected proxy call into {app_delegate_path}")
-    else:
-        print("[WARN] Could not find end of SharedAccountContext constructor, trying fallback")
-else:
-    # Fallback: inject near 'self.accountManager ='
-    fallback_marker = "self.accountManager = accountManager"
-    if fallback_marker in content:
-        idx = content.index(fallback_marker)
-        newline_after = content.index('\n', idx)
-        injection_point = newline_after + 1
-        patched = (
-            content[:injection_point]
-            + PROXY_SWIFT
-            + content[injection_point:]
-        )
-        with open(app_delegate_path, 'w') as f:
-            f.write(patched)
-        print(f"[OK] Injected proxy call via fallback marker into {app_delegate_path}")
-    else:
-        print("[WARN] No injection point found. Proxy must be configured manually on first launch.")
-        print(f"      URL: tg://proxy?server={PROXY_SERVER}&port={PROXY_PORT}&secret={PROXY_SECRET}")
+MARKERS = [
+    "let sharedContext = SharedAccountContext(",
+    "self.accountManager = accountManager",
+    "SharedAccountContext.init(",
+    "self.sharedContext =",
+]
 
-# Register AnyGramProxySetup.swift in the TelegramUI BUILD file
-build_file = os.path.join(app_delegate_dir, "..", "BUILD")
+injected = False
+for marker in MARKERS:
+    if marker in content:
+        # Find end of that line
+        idx = content.index(marker)
+        # If it's a constructor spanning multiple lines, find the end paren
+        if marker.endswith("("):
+            depth, i = 0, idx
+            while i < len(content):
+                if content[i] == '(':   depth += 1
+                elif content[i] == ')': depth -= 1
+                if depth == 0: break
+                i += 1
+            eol = content.find('\n', i) + 1
+        else:
+            eol = content.find('\n', idx) + 1
+
+        patched = content[:eol] + INJECTION + content[eol:]
+        with open(app_delegate, 'w') as f:
+            f.write(patched)
+        print(f"[OK] Injected proxy call after marker: {marker[:60]!r}")
+        injected = True
+        break
+
+if not injected:
+    print("[WARN] No injection marker found in AppDelegate.swift")
+    print(f"       Add the proxy URL manually: tg://proxy?server={PROXY_SERVER}&port={PROXY_PORT}&secret={PROXY_SECRET}")
+
+# ── Register in TelegramUI BUILD file ────────────────────────────────────────
+build_file = os.path.join(sources_dir, "..", "BUILD")
 if os.path.exists(build_file):
     with open(build_file) as f:
-        build_content = f.read()
-    if "AnyGramProxySetup.swift" not in build_content:
-        # Add to swift_sources list — look for AppDelegate.swift entry and add after it
-        build_content = build_content.replace(
-            '"Sources/AppDelegate.swift"',
-            '"Sources/AppDelegate.swift",\n        "Sources/AnyGramProxySetup.swift"'
-        )
-        with open(build_file, 'w') as f:
-            f.write(build_content)
-        print(f"[OK] Registered AnyGramProxySetup.swift in BUILD")
+        build = f.read()
+    if "AnyGramProxySetup.swift" not in build:
+        # Look for AppDelegate.swift entry in swift_sources
+        for target in ['"Sources/AppDelegate.swift"', "'Sources/AppDelegate.swift'"]:
+            if target in build:
+                replacement = target + ',\n        "Sources/AnyGramProxySetup.swift"'
+                build = build.replace(target, replacement, 1)
+                with open(build_file, 'w') as f:
+                    f.write(build)
+                print(f"[OK] Registered AnyGramProxySetup.swift in TelegramUI BUILD")
+                break
+        else:
+            print("[WARN] Could not find AppDelegate.swift in BUILD, skipping registration")
+            print("       Build may fail if AnyGramProxySetup.swift is not in BUILD sources")
+else:
+    print(f"[WARN] BUILD file not found at {build_file}")
 
 print("[DONE] Proxy injection complete")
+print(f"       Proxy: {PROXY_SERVER}:{PROXY_PORT} (MTProto FakeTLS)")
