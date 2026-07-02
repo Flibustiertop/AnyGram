@@ -75,6 +75,18 @@ def strip_entitlements(path):
     with open(path) as f:
         txt = f.read()
     changed = False
+    # Remove App Groups (CRITICAL: causes black screen when sideloaded with free Apple ID).
+    # App Group "group.ph.telegra.Telegraph" belongs to Telegram's team (C67CF9S4VU).
+    # Free Apple ID provisioning profiles cannot include a foreign team's App Groups,
+    # so the app crashes instantly on launch when the entitlement is present.
+    # --disableExtensions in the Bazel build also helps, but this is belt-and-suspenders.
+    for key in ["com.apple.security.application-groups"]:
+        pattern = rf'<key>{re.escape(key)}</key>\s*<array>.*?</array>'
+        new_txt = re.sub(pattern, '', txt, flags=re.DOTALL)
+        if new_txt != txt:
+            txt = new_txt
+            changed = True
+
     # Remove iCloud-related entitlements
     for key in [
         "com.apple.developer.icloud-container-identifiers",

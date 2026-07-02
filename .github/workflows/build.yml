@@ -110,6 +110,10 @@ jobs:
           echo "Build: v$VER ($BUILD)"
 
       # ── 10. Build IPA with Bazel + fake-codesigning ────────────────────
+      # --disableExtensions is REQUIRED for sideloading with a free Apple ID.
+      # Without it, the app uses App Groups (group.ph.telegra.Telegraph) which
+      # belongs to Telegram's team and cannot be provisioned by a personal Apple ID,
+      # causing an instant crash (black screen) on launch.
       - name: Build AnyGram
         run: |
           cd /Users/Shared/telegram-ios
@@ -121,7 +125,8 @@ jobs:
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="${{ steps.meta.outputs.BUILD_NUMBER }}"
+            --buildNumber="${{ steps.meta.outputs.BUILD_NUMBER }}" \
+            --disableExtensions
 
       # ── 11. Collect & verify IPA ──────────────────────────────────────────
       - name: Collect IPA
@@ -169,7 +174,104 @@ jobs:
           ls -lh /tmp/anygram-artifacts/AnyGram.ipa
           echo "IPA collected successfully"
 
-      # ── 12. Upload IPA artifact ───────────────────────────────────────────
+      # ── 12. Strip extensions & App Groups from IPA ───────────────────────
+      # Extra safety: remove any .appex bundles and the App Groups entitlement
+      # from the IPA so Sideloadly's re-signing never encounters them.
+      - name: Strip extensions from IPA
+        run: |
+          cd /tmp/anygram-artifacts
+          mkdir -p strip_work
+
+          # Unzip IPA
+          unzip -q AnyGram.ipa -d strip_work/
+
+          APP_DIR=$(ls strip_work/Payload/)
+          APP_PATH="strip_work/Payload/$APP_DIR"
+          echo "App path: $APP_PATH"
+
+          # Remove all app extensions (.appex)
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            echo "Extensions found:"
+            ls "$APP_PATH/PlugIns/" || true
+            rm -rf "$APP_PATH/PlugIns"
+            echo "[OK] Removed PlugIns directory"
+          else
+            echo "[OK] No PlugIns directory"
+          fi
+
+          # Remove WatchKit app if present
+          if [ -d "$APP_PATH/Watch" ]; then
+            rm -rf "$APP_PATH/Watch"
+            echo "[OK] Removed Watch directory"
+          fi
+
+          # Strip App Groups from embedded entitlements using Python
+          python3 - "$APP_PATH" <<'PYEOF'
+          import os, plistlib, subprocess, sys
+
+          app_path = sys.argv[1]
+          binary_name = os.path.splitext(os.path.basename(app_path))[0]
+          binary_path = os.path.join(app_path, binary_name)
+
+          if not os.path.exists(binary_path):
+              print(f"[WARN] Binary not found: {binary_path}")
+              sys.exit(0)
+
+          # Extract embedded entitlements from binary
+          result = subprocess.run(
+              ["codesign", "-d", "--entitlements", "-", "--xml", binary_path],
+              capture_output=True
+          )
+          if result.returncode != 0:
+              print(f"[INFO] codesign extract returned {result.returncode}, skipping entitlement patch")
+              sys.exit(0)
+
+          try:
+              ents = plistlib.loads(result.stdout)
+          except Exception as e:
+              print(f"[INFO] Could not parse entitlements: {e}")
+              sys.exit(0)
+
+          changed = False
+          for key in [
+              "com.apple.security.application-groups",
+              "com.apple.developer.icloud-container-identifiers",
+              "com.apple.developer.icloud-services",
+              "com.apple.developer.ubiquity-container-identifiers",
+              "com.apple.developer.ubiquity-kvstore-identifier",
+              "com.apple.developer.siri",
+          ]:
+              if key in ents:
+                  del ents[key]
+                  changed = True
+                  print(f"[OK] Removed entitlement: {key}")
+
+          if changed:
+              ents_file = "/tmp/stripped.entitlements"
+              with open(ents_file, "wb") as f:
+                  plistlib.dump(ents, f, fmt=plistlib.FMT_XML)
+              # Re-sign binary with stripped entitlements using fake cert
+              r = subprocess.run(
+                  ["codesign", "--force", "--sign", "-", "--entitlements", ents_file, binary_path],
+                  capture_output=True
+              )
+              print(f"[INFO] Re-sign result: {r.returncode}")
+              if r.stderr:
+                  print(r.stderr.decode())
+          else:
+              print("[OK] No problematic entitlements found in binary")
+          PYEOF
+
+          # Repack IPA
+          rm AnyGram.ipa
+          cd strip_work
+          zip -qr ../AnyGram.ipa Payload/
+          cd ..
+          rm -rf strip_work
+          ls -lh AnyGram.ipa
+          echo "[OK] IPA repacked without extensions"
+
+      # ── 13. Upload IPA artifact ───────────────────────────────────────────
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
