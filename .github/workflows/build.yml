@@ -1,0 +1,137 @@
+name: Build AnyGram IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-13
+    timeout-minutes: 350
+
+    steps:
+      # ── 1. Checkout our config / patch files ──────────────────────────────
+      - name: Checkout AnyGram config
+        uses: actions/checkout@v4
+        with:
+          path: anygram-config
+
+      # ── 2. Free disk space ────────────────────────────────────────────────
+      - name: Free disk space
+        run: |
+          echo "Disk before:"
+          df -h /
+          # Remove unused Xcode simulators runtimes (saves ~10 GB)
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
+          # Remove Android SDK if present
+          sudo rm -rf /usr/local/lib/android || true
+          # Remove .NET
+          sudo rm -rf /usr/share/dotnet || true
+          echo "Disk after:"
+          df -h /
+
+      # ── 3. Select the right Xcode version required by Swiftgram ──────────
+      - name: Set Xcode version
+        run: |
+          # Swiftgram pins a specific Xcode — try to select it
+          XCODE_VERSION=$(curl -s https://raw.githubusercontent.com/Swiftgram/Telegram-iOS/master/versions.json \
+            | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj["xcode"])' 2>/dev/null || echo "")
+          echo "Required Xcode: $XCODE_VERSION"
+          if [ -n "$XCODE_VERSION" ] && [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          else
+            # Use whatever Xcode is available
+            AVAILABLE=$(ls /Applications | grep -E "^Xcode[_ ]" | tail -1)
+            echo "Using available: $AVAILABLE"
+            sudo xcode-select -s "/Applications/${AVAILABLE}/Contents/Developer" || true
+          fi
+          xcodebuild -version
+
+      # ── 4. Clone Swiftgram (shallow + shallow submodules) ────────────────
+      - name: Clone Swiftgram
+        run: |
+          echo "Cloning Swiftgram (shallow)..."
+          git clone \
+            --depth=1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            -j8 \
+            https://github.com/Swiftgram/Telegram-iOS.git \
+            /Users/Shared/telegram-ios
+          echo "Clone done. Disk:"
+          df -h /
+
+      # ── 5. Apply AnyGram branding ─────────────────────────────────────────
+      - name: Apply branding (name, bundle ID, API keys)
+        env:
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 anygram-config/patches/apply_branding.py \
+            /Users/Shared/telegram-ios \
+            "${TELEGRAM_API_ID:-34053256}" \
+            "${TELEGRAM_API_HASH:-bc8984a70877b5768e5a6a80222da985}"
+
+      # ── 6. Inject default MTProto proxy ──────────────────────────────────
+      - name: Inject default proxy
+        run: |
+          python3 anygram-config/patches/apply_proxy.py /Users/Shared/telegram-ios
+
+      # ── 7. Replace app icon ───────────────────────────────────────────────
+      - name: Replace app icon
+        run: |
+          chmod +x anygram-config/patches/apply_icon.sh
+          bash anygram-config/patches/apply_icon.sh \
+            /Users/Shared/telegram-ios \
+            anygram-config/assets/AppIcon.png
+
+      # ── 8. Import fake codesigning certificates ───────────────────────────
+      - name: Import fake codesigning certs
+        run: |
+          cd /Users/Shared/telegram-ios
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+      # ── 9. Calculate build number ─────────────────────────────────────────
+      - name: Calculate build number
+        id: buildnum
+        run: |
+          cd /Users/Shared/telegram-ios
+          OFFSET=$(cat build_number_offset 2>/dev/null || echo 0)
+          COUNT=$(git rev-list --count HEAD)
+          BUILDNUM=$((COUNT + OFFSET))
+          APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"])' 2>/dev/null || echo "1.0")
+          echo "BUILD_NUMBER=$BUILDNUM"  >> $GITHUB_OUTPUT
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_OUTPUT
+          echo "Build: $APP_VERSION ($BUILDNUM)"
+
+      # ── 10. Build with Bazel ──────────────────────────────────────────────
+      - name: Build AnyGram IPA
+        run: |
+          cd /Users/Shared/telegram-ios
+          BAZEL_ROOT="/private/var/tmp/_bazel_anygram"
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_ROOT" \
+            build \
+            --configurationPath="build-system/anygram-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="${{ steps.buildnum.outputs.BUILD_NUMBER }}"
+
+      # ── 11. Collect IPA ───────────────────────────────────────────────────
+      - name: Collect IPA
+        run: |
+          mkdir -p /Users/Shared/telegram-ios/build/artifacts
+          for f in /Users/Shared/telegram-ios/bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            [ -f "$f" ] && cp "$f" /Users/Shared/telegram-ios/build/artifacts/AnyGram.ipa && echo "Copied: $f" && break
+          done
+          ls -lh /Users/Shared/telegram-ios/build/artifacts/ || echo "No artifacts found"
+
+      # ── 12. Upload IPA artifact ───────────────────────────────────────────
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyGram-Swiftgram-IPA
+          path: /Users/Shared/telegram-ios/build/artifacts/AnyGram.ipa
+          retention-days: 14
